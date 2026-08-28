@@ -1,5 +1,6 @@
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,6 +14,7 @@ from benchmarks.timing import (
     _collect_attributed,
     _CUPTIAttributionError,
     _CUPTIRecordsLostError,
+    _MCPTIAdapter,
     _OffThreadLaunchError,
     bench_kernel,
 )
@@ -69,6 +71,36 @@ def test_multi_input_op_raises_keyerror():
     """Multi-input ops (q/k/v) raise instead of binding a wrong tensor."""
     with pytest.raises(KeyError, match="exactly one manifest tensor input"):
         workloads_to_params("GroupedQueryAttentionFwdOp")
+
+
+def test_mcpti_adapter_emits_cupti_external_correlation(monkeypatch):
+    kind = SimpleNamespace(CONCURRENT_KERNEL=1, EXTERNAL_CORRELATION=2)
+    callback = {}
+    timestamps = iter((10, 20))
+    raw = SimpleNamespace(
+        ActivityKind=kind,
+        get_timestamp=lambda: next(timestamps),
+        activity_enable=lambda value: None,
+        activity_disable=lambda value: None,
+    )
+    raw.activity_register_callbacks = lambda requested, completed: callback.update(fn=completed)
+    raw.activity_flush_all = lambda flag: callback["fn"](
+        [SimpleNamespace(kind=1, name="kernel", start=12, end=18, correlation_id=3)]
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    records = []
+    adapter = _MCPTIAdapter(raw)
+
+    adapter.activity_register_callbacks(lambda: None, records.extend)
+    adapter.activity_enable(kind.CONCURRENT_KERNEL)
+    adapter.activity_push_external_correlation_id(0, 7)
+    adapter.activity_pop_external_correlation_id(0)
+    adapter.activity_flush_all(1)
+
+    assert [(record.kind, getattr(record, "external_id", None)) for record in records] == [
+        (kind.CONCURRENT_KERNEL, None),
+        (kind.EXTERNAL_CORRELATION, 7),
+    ]
 
 
 def _kernel(start_ns: int, end_ns: int, correlation_id: int = 0) -> dict:

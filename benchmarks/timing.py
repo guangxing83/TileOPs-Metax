@@ -4,11 +4,10 @@ The timing layer owns the measurement and nothing else -- it knows how to run a 
 n times and return each run's device latency. What the numbers mean, and where they are
 written, belong to the layers above.
 
-A kernel belongs to the iteration whose external correlation id it carries, so nothing
-is inferred from timestamps and a kernel shorter than the host overhead around it is
-attributed as reliably as a long one. CUPTI's id stack is per-thread, which is this
-protocol's one demand on a timed callable: it must launch its own work rather than hand
-it to another thread (``Tensor.backward`` hands it to autograd's engine thread;
+NVIDIA CUPTI assigns a kernel to the iteration whose external correlation id it carries.
+MetaX MCPTI does not expose that API in Python, so its synchronized calls are assigned by
+device-clock timestamp windows instead. A timed callable must launch its own work rather
+than hand it to another thread (``Tensor.backward`` hands it to autograd's engine thread;
 ``grad_fn.apply`` does not).
 """
 
@@ -18,6 +17,7 @@ import logging
 import os
 import sys
 import threading
+from types import SimpleNamespace
 from typing import Any, Callable, NamedTuple, Optional
 
 import torch
@@ -44,6 +44,7 @@ _cuda_runtime_unavailable = False
 # CUPTI activity collection, via NVIDIA's cupti-python binding.
 
 _CUPTI = None
+_CUPTI_BACKEND = "cupti"
 _COLLECTOR_ACTIVE = False
 _CALLBACKS_REGISTERED = False
 # Whatever CUPTI does with a buffer between handing it back and asking for the next one
@@ -91,19 +92,111 @@ class CUPTIError(RuntimeError):
     """The CUPTI collector is unavailable or could not be operated."""
 
 
+class _ExternalCorrelationKind:
+    CUSTOM0 = 0
+
+
+class _MCPTIAdapter:
+    """Expose MCPTI through the CUPTI subset used by this module."""
+
+    ExternalCorrelationKind = _ExternalCorrelationKind
+    runtime_api_trace_cbid = ()
+    driver_api_trace_cbid = ()
+
+    def __init__(self, mcpti):
+        self._mcpti = mcpti
+        self.ActivityKind = mcpti.ActivityKind
+        self._completed = None
+        self._records = []
+        self._stack = []
+        self._windows = []
+
+    def activity_register_callbacks(self, requested, completed):
+        self._completed = completed
+
+        def copy_records(records):
+            for record in records:
+                if int(record.kind) == int(self.ActivityKind.CONCURRENT_KERNEL):
+                    self._records.append(
+                        SimpleNamespace(
+                            kind=record.kind,
+                            name=str(record.name),
+                            start=int(record.start),
+                            end=int(record.end),
+                            correlation_id=int(record.correlation_id),
+                        )
+                    )
+
+        self._mcpti.activity_register_callbacks(requested, copy_records)
+
+    def activity_enable(self, kind):
+        if int(kind) == int(self.ActivityKind.CONCURRENT_KERNEL):
+            self._records.clear()
+            self._stack.clear()
+            self._windows.clear()
+            self._mcpti.activity_enable(kind)
+
+    def activity_disable(self, kind):
+        if int(kind) == int(self.ActivityKind.CONCURRENT_KERNEL):
+            self._mcpti.activity_disable(kind)
+
+    def activity_flush_all(self, flag):
+        self._mcpti.activity_flush_all(flag)
+        records = []
+        for record in self._records:
+            records.append(record)
+            external_id = next(
+                (
+                    external_id
+                    for external_id, start, end in self._windows
+                    if start <= record.start and record.end <= end
+                ),
+                None,
+            )
+            if external_id is not None:
+                records.append(
+                    SimpleNamespace(
+                        kind=self.ActivityKind.EXTERNAL_CORRELATION,
+                        correlation_id=record.correlation_id,
+                        external_id=external_id,
+                    )
+                )
+        self._records.clear()
+        self._completed(records)
+
+    def activity_get_num_dropped_records(self, context, stream, address):
+        ctypes.c_size_t.from_address(address).value = 0
+
+    def activity_enable_runtime_api(self, cbid, enable):
+        return None
+
+    def activity_enable_driver_api(self, cbid, enable):
+        return None
+
+    def activity_push_external_correlation_id(self, kind, external_id):
+        self._stack.append((external_id, int(self._mcpti.get_timestamp())))
+
+    def activity_pop_external_correlation_id(self, kind):
+        torch.cuda.synchronize()
+        external_id, start = self._stack.pop()
+        self._windows.append((external_id, start, int(self._mcpti.get_timestamp())))
+
+
 def _load_cupti():
-    global _CUPTI
+    global _CUPTI, _CUPTI_BACKEND
     if _CUPTI is not None:
         return _CUPTI
     try:
         from cupti import cupti
-    except Exception as exc:  # noqa: BLE001
-        raise CUPTIError(
-            "cupti-python is unavailable. Install it with "
-            "`pip install --no-deps cupti-python==13.2.0`; --no-deps is required "
-            "or it downgrades torch's cuda-bindings pin."
-        ) from exc
-    _CUPTI = cupti
+
+        _CUPTI = cupti
+    except Exception:  # noqa: BLE001
+        try:
+            from mcpti import mcpti
+        except Exception as exc:  # noqa: BLE001
+            raise CUPTIError("neither cupti-python nor mcpti-python is available") from exc
+        _CUPTI = _MCPTIAdapter(mcpti)
+        _CUPTI_BACKEND = "mcpti"
     return _CUPTI
 
 
@@ -652,7 +745,7 @@ def bench_kernel(
     try:
         with _native_output_suppressor():
             samples = _collect_attributed(_run, n_repeat, _prepare_iteration)
-        _bench_meta.timing = "cupti"
+        _bench_meta.timing = _CUPTI_BACKEND
     except (_CUPTIAttributionError, CUPTIError) as exc:
         if isinstance(exc, CUPTIError):
             try:
